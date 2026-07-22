@@ -4,7 +4,7 @@
 A system that tests whether an AI agent *actually did* the right thing — not whether it *said* it did. Most agent projects build an agent and hope it works. This project builds the testing environment first, then plugs agents into it and measures them with a strict 3-layer verifier.
 
 ## Why I Built the Environment Before Any Agent
-If tools are standalone functions, they don't share state — Tool A has no idea what Tool B did. That can't catch real bugs, because in a real enterprise system, actions have consequences that persist: if a refund is processed, the order status must actually change to "refunded," and stay that way. So I built a `CustomerSupportEnvironment` class first — orders database, inventory, tickets, and an action log — all sharing one `self.state`, and tested it manually before any agent touched it. This mirrors how Deccan AI's real STARK product works: the environment is validated independently before it's used to evaluate a model.
+If tools are standalone functions, they don't share state — Tool A has no idea what Tool B did. That can't catch real bugs, because in a real enterprise system, actions have consequences that persist: if a refund is processed, the order status must actually change to "refunded," and stay that way. So I built a `CustomerSupportEnvironment` class first — orders database, inventory, tickets, and an action log — all sharing one `self.state`, and tested it manually before any agent touched it. 
 
 ## The 5 Tools
 `lookup_order`, `check_refund_policy`, `process_refund`, `check_inventory`, `escalate_to_human` — all built as methods of the environment (not standalone functions), so they share state and can see what other tools already did.
