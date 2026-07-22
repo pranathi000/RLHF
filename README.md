@@ -1,76 +1,315 @@
-# Mini-STARK: A Stateful Customer Support Environment for Agent Evaluation
+# Mini-STARK: A Stateful Agent Evaluation Environment
 
-## What This Project Is
-A system that tests whether an AI agent *actually did* the right thing — not whether it *said* it did. Most agent projects build an agent and hope it works. This project builds the testing environment first, then plugs agents into it and measures them with a strict 3-layer verifier.
+> "You cannot trust what an agent says. You have to verify what actually happened."
 
-## Why I Built the Environment Before Any Agent
-If tools are standalone functions, they don't share state — Tool A has no idea what Tool B did. That can't catch real bugs, because in a real enterprise system, actions have consequences that persist: if a refund is processed, the order status must actually change to "refunded," and stay that way. So I built a `CustomerSupportEnvironment` class first — orders database, inventory, tickets, and an action log — all sharing one `self.state`, and tested it manually before any agent touched it. 
+A production-inspired evaluation framework for AI agents built around
+stateful environments, multi-layer verification, and structured scenario testing.
 
-## The 5 Tools
-`lookup_order`, `check_refund_policy`, `process_refund`, `check_inventory`, `escalate_to_human` — all built as methods of the environment (not standalone functions), so they share state and can see what other tools already did.
+---
 
-**Verified behavior from actual test run:**
-- Tried to skip the policy check and refund directly → correctly blocked: `"check_refund_policy must be called before process_refund"`
-- Correct order → refund processed, confirmation `REF-E992F1`, order status flipped from `delivered` to `refunded`
-- $500 refund attempt → correctly flagged `requires_human_approval: True`
-- Escalating twice in the same conversation → second attempt blocked: `escalation_loop_detected`
+## What This Project Builds
 
-## The 3-Layer Verifier (core idea of the project)
-> "A valid tool call does not imply a valid workflow. A valid workflow does not imply a valid outcome. Those are three different things requiring three different checks."
+An environment that evaluates AI agents the way real systems should —
+not by reading the agent's response, but by checking what the database
+actually contains after the agent runs.
 
-- **Layer 1 — Step validity**: correct tool name, correct argument type. Caught a hallucinated tool name and a wrong argument type in testing.
-- **Layer 2 — Sequence validity**: correct order of tool calls. Caught `process_refund` being called before `check_refund_policy`.
-- **Layer 3 — End-state validity**: did the database actually change. Caught a case where the agent claimed success but the order status was still `delivered`.
+Most agent projects show the agent working. This project shows how to
+know whether the agent actually worked.
 
-**Proof of why all 3 layers matter (Test 9):** an agent skipped the policy check. Layer 1 passed (real tools, correct types) — but Layer 2 and Layer 3 both failed. A single-layer check would have wrongly said "agent did fine."
+---
 
-## Agent Evaluation Results (real, measured numbers)
-Built a ReAct agent and a LangGraph agent, ran both on 6 scenarios:
+## The Core Insight
 
-| Scenario | Difficulty | ReAct | LangGraph |
-|---|---|---|---|
-| easy_1 | easy | FAIL | FAIL |
-| hard_1 | hard | PASS | PASS |
-| recovery_1 | recovery | PASS | PASS |
-| safety_1 | safety | FAIL | FAIL |
-| adversarial_1 | adversarial | FAIL | FAIL |
-| regression_1 | regression | FAIL | FAIL |
+When an AI agent processes a refund, three things need to be true:
 
-**Both scored 2/6 (33%) — identically.**
+- The agent called real tools with correct arguments
+- The agent called those tools in the correct sequence
+- The database actually reached the correct final state
 
-Key finding: since two different frameworks failed the exact same scenarios, the bottleneck is the LLM's reasoning/instruction-following, not the agent architecture. Layer 1 (step validity) passed 100% of the time for both — no hallucinated tools ever. All failures were at Layer 2 (wrong sequence) or Layer 3 (database never actually updated despite claimed success).
+These are three separate properties. An agent can satisfy the first
+without satisfying the second. It can satisfy both without satisfying
+the third. This project builds a verification system that checks all
+three independently.
 
-## Why INFRA_FAIL Was Added as Its Own Category
-Hit real HTTP 429 rate-limit errors from the model provider during evaluation. The agent caught the exception and returned an empty trajectory — which looks identical to an agent that simply chose to skip every tool call. Without separating these, pass rate and agent-comparison numbers would be silently wrong. Added `INFRA_FAIL` (429s, 404s, timeouts — anywhere the LLM never got to decide) and excluded these from all pass-rate/comparison metrics.
+---
 
-**Principle:** you cannot evaluate an agent against an unstable environment and call the results valid.
+---
 
-## Recovery Testing — 4 Findings
-Injected a `database_unavailable` failure mid-conversation, then restored it.
+## Project Stages
 
-1. **Environment state survives failures.** Database was never corrupted; failed tool calls leave state unchanged.
-2. **Escalation loop detection works at the environment level**, with zero agent-side logic needed.
-3. **Conversation context does NOT survive failures.** If the agent crashes mid-conversation, everything the customer said is gone; the agent restarts from scratch. Root cause: conversation memory lives only in the LLM's context window. Fix: LangGraph checkpointing to external storage (SQLite/Redis).
-4. **Sequence enforcement survives failure and restore.** Agent called `check_refund_policy`, database crashed, database restored, agent called `process_refund` — it worked. Not because the LLM "remembered," but because `action_log` lives in persistent environment state, not LLM memory.
+#### Stage 1 — Stateful Environment
 
-## The Architectural Lesson
-There are two separate memory systems in an agent:
-- **Environment memory** (`self.state`, `action_log`) — survives failures, reliable, ground truth. This is what the verifier trusts.
-- **Conversation memory** (LLM context window) — does NOT survive failures, lost on crash. LangGraph checkpointing is the fix.
+Built a `CustomerSupportEnvironment` class where every tool
+call modifies shared state. When a refund is processed, the
+order status updates permanently. When `lookup_order` is called
+again after that, it reflects the change.
 
-A production agent needs both types to be persistent.
+This is the foundation that makes honest evaluation possible.
+The environment owns the database. The environment is the
+source of truth. Not the agent.
 
-## How This Connects to Deccan AI's STARK
-Same core philosophy: don't trust what the agent says — verify what actually happened. Both share: (1) a stateful environment, (2) tool-based actions, (3) multi-layer verification instead of trust, (4) scenario-based evaluation. Key difference: STARK is an RL training environment where the verifier produces a reward signal; Mini-STARK is an evaluation environment where the verifier produces pass/fail evidence. Same philosophy, different purpose.
+**Key design decision:** Tools are class methods sharing
+`self.state`, not standalone functions. This means every tool
+automatically sees the effects of every other tool. State
+persists across the entire conversation.
 
-## Final Status
-| Component | Status |
+**What the environment tracks:**
+- Live order and inventory database
+- Complete action log with timestamps for every tool call
+- State snapshots before and after every agent run
+- Controlled failure injection for recovery testing
+
+---
+
+#### Stage 2 — 3-Layer Verifier
+
+Built an `AgentVerifier` that checks agent behavior at three
+independent levels after every run.
+
+#### Layer 1 — Step Verification
+Validates each individual tool call in isolation.
+Checks tool name validity and argument types.
+
+#### Layer 2 — Sequence Verification
+Validates the ordering of tool calls across the full run.
+Enforces that eligibility is checked before processing a refund.
+
+#### Layer 3 — End State Verification
+Validates the database state after the agent finishes.
+Checks that the correct records were created and the correct
+fields were updated.
+
+**Why 3 layers matter:**
+
+Each layer catches a class of failure the others cannot see.
+The clearest proof: one test where both tool calls were valid
+(Layer 1 passed) but a required step was missing and the
+database never updated (Layers 2 and 3 caught it). Without
+all three layers, that failure would have been invisible.
+
+---
+
+#### Stage 3 — Two Agents and Evaluation Suite
+
+Built two agents using different architectures and evaluated
+them under identical conditions inside the same environment.
+
+**ReAct Agent — Pure Python**
+The reasoning loop built from scratch. Think → Act → Observe.
+Every step is explicit, visible, and traceable. Hard limits
+on steps and tool calls prevent runaway costs.
+
+**LangGraph Agent**
+The same logic rebuilt using LangGraph's StateGraph.
+Automatic state management, explicit conditional routing,
+and built-in support for conversation checkpointing.
+
+**6 Scenario Types**
+
+| Scenario | Purpose |
 |---|---|
-| Environment | DONE — stateful, failure injection, snapshots |
-| Verifier | DONE — 3 layers, each catches a different failure class |
-| Recovery Testing | DONE — 4 findings, two memory systems identified |
-| Eval Framework | DONE — PASS / AGENT_FAIL / INFRA_FAIL classification |
-| Agent Comparison | Partially blocked by infrastructure rate limits, not a code problem |
+| Easy | Validates correct end-to-end refund flow |
+| Hard | Tests graceful handling of missing orders |
+| Recovery | Tests behavior when information is incomplete |
+| Safety | Validates human approval trigger for high value actions |
+| Adversarial | Tests policy enforcement under user pressure |
+| Regression | Prevents previously fixed bugs from returning |
 
-## What I'd Add With More Time
-Run the same environment across multiple models to compare trajectory adherence, add LangGraph checkpointing to fix conversation memory loss, and track behavioral drift across model versions.
+**Structured Outcome Classification**
+
+Every run is classified into one of these categories before
+any metrics are calculated:
+
+| Category | Meaning |
+|---|---|
+| PASS | All 3 verifier layers confirmed correct behavior |
+| AGENT_FAIL | Agent ran but behavior violated verification rules |
+| INFRA_FAIL | Provider-side issue, LLM never executed |
+| TOOL_FAIL | Environment tool raised an unexpected exception |
+| VERIFIER_FAIL | Verifier encountered an unexpected error |
+
+The INFRA_FAIL category is a deliberate design choice.
+A provider rate limit error produces an empty tool trajectory.
+Without classification, that looks identical to an agent that
+skipped all required steps. Separating infrastructure issues
+from reasoning issues keeps evaluation metrics scientifically
+valid. INFRA_FAIL runs are excluded from all quality metrics.
+
+---
+
+#### Stage 4 — Recovery Testing
+
+Tested environment and agent behavior when failures occur
+mid-conversation using controlled failure injection and a
+ScriptedAgent that follows known-correct tool sequences.
+
+**Key Architectural Finding**
+
+An AI agent has two memory systems with completely different
+persistence properties:
+
+**Environment Memory**
+The database, action log, and state snapshots.
+Lives in the environment object.
+Persists through tool failures because errors return without
+modifying state. Changes only happen on successful completion.
+
+**Conversation Memory**
+The user messages, tool results, and agent reasoning.
+Lives in the LLM context window during one run.
+Requires external persistence to survive crashes.
+LangGraph checkpointing is the architectural fix.
+
+**What Recovery Testing Proved**
+
+Sequence enforcement remained effective after a simulated
+database failure and restore cycle. This is because the
+verifier reads from the persistent action_log stored in
+environment memory rather than from model memory. The log
+survived the failure. Sequence enforcement never lost track
+of what had already happened.
+
+This proves a broader principle:
+**Critical workflow state belongs in persistent system state,
+not in model memory.**
+
+---
+
+#### Stage 5 — Analysis and Lessons
+
+**The Central Finding**
+
+> A valid tool call does not imply a valid workflow.
+> A valid workflow does not imply a valid outcome.
+> These are three separate properties requiring three
+> separate verification layers.
+
+**On Evaluation Integrity**
+
+A reliable evaluation system must separate what the
+infrastructure did from what the agent did. Running metrics
+across both without distinction produces numbers that measure
+combined system reliability, not agent reasoning quality.
+This project implements that separation explicitly.
+
+**Roadmap**
+
+Given a stable model endpoint and extended time:
+
+1. Full agent comparison with clean evaluation results
+2. Prompt engineering experiment to separate prompt quality
+   from model capability as sources of behavior differences
+3. LangGraph checkpointing implementation for conversation
+   memory persistence across failures
+4. Multi-model comparison using identical scenarios to
+   measure how model capability affects trajectory adherence
+5. Behavioral drift tracking across model versions to detect
+   when updates change agent behavior on known scenarios
+
+---
+
+## Key Design Decisions
+
+#### Environment Before Agent
+The environment was fully built and tested before any agent
+code was written. This ensures the evaluation system is an
+independent source of truth that does not depend on the agent
+behaving correctly to produce valid measurements.
+
+#### Tools As Class Methods
+All tools are methods of the environment class sharing
+`self.state`. This makes state persistence automatic and
+makes the environment the single source of truth for
+everything that happened during a run.
+
+#### Action Log As Verification Source
+The action log is part of `self.state` and is included in
+every snapshot. This makes it persistent through failures
+and keeps it synchronized with all other state. The verifier
+reads from the log rather than from model memory, which is
+what makes verification resilient to mid-conversation crashes.
+
+#### First Class Failure Classification
+Infrastructure failures, tool failures, and agent reasoning
+failures are classified separately before any metrics are
+computed. This is a requirement for any evaluation system
+that communicates with external APIs.
+
+---
+
+## What This Project Demonstrates
+
+**Environment-first agent evaluation**
+The environment is the product. The agent is one component
+evaluated inside it. Any agent architecture can be plugged
+in and measured under identical conditions.
+
+**Multi-layer verification**
+Three independent checks that together cover the full space
+of agent behavior failures. No single check is sufficient.
+
+**Failure classification before metrics**
+Infrastructure issues are separated from reasoning issues
+before pass rates are computed. Metrics mean something only
+when the denominator contains valid runs.
+
+**Recovery-aware design**
+The distinction between environment memory and conversation
+memory is made explicit and the architectural implications
+are tested and documented.
+
+---
+
+## Tech Stack
+
+- Python 3.12
+- LangGraph
+- Google Gemini API
+- Google Colab T4
+- No GPU required
+
+---
+
+## How To Run
+
+```python
+# Initialize environment and verifier
+env      = CustomerSupportEnvironment()
+verifier = AgentVerifier()
+
+# Choose an agent
+agent = ReActAgent(env)
+# or
+agent = LangGraphAgent(env)
+
+# Run evaluation across all scenarios
+results = run_evaluation(
+    env, verifier, agent, test_scenarios, "ReAct"
+)
+```
+
+---
+
+## Summary
+
+| What Was Built | What It Proves |
+|---|---|
+| Stateful environment | Actions have consequences the verifier can measure |
+| 3-layer verifier | Tool correctness, workflow correctness, and outcome correctness are separate |
+| Dual agent evaluation | Same environment evaluates different architectures fairly |
+| Recovery testing | Environment memory and conversation memory behave differently under failure |
+| Failure classification | Infrastructure issues and reasoning issues require separate treatment |
+
+---
+
+## The One Lesson
+
+The most valuable thing this project demonstrates is not
+that agents can call tools correctly. It is that calling
+tools correctly is not enough. The sequence must be correct.
+The database must actually update. And the evaluation system
+must be honest about what it measured and what it did not.
+
+Build the environment first.
+Verify everything independently.
+Classify failures before computing metrics.
